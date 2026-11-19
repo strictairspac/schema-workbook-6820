@@ -44,6 +44,26 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 
 这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
 
+## 报告查询读写分离
+
+写入（草案、依赖、任务快照、入队、审计）始终走主库；`/reports` 列表与 `/reports/{id}` 详情默认走只读从库，用 `DATABASE_REPLICA_URL` 开启（留空则读主库，单库行为不变）。API 响应带 `read_source`（`primary` / `replica` / `mixed`），列表页与详情页分别标注本次实际读取的库。
+
+前端每个标签页生成稳定的阅读会话标识（`X-Read-Session`），后端按会话维护进度下界：
+
+- **刚受理的任务仍查得到**：创建报告时登记编号；从库尚未复制到也由主库补齐，标为 `mixed`。
+- **已读进度不倒退**：会话读到的状态只前进（`queued → running → completed/failed`）。复制延迟或并发刷新乱序返回旧值时，以已读进度为准，不会把完成刷回排队；前端也按同一规则合并响应并丢弃过期请求。
+- **其余会话继续读从库**：进度下界按标签页隔离，一个会话的补齐不影响其他会话的读取来源。
+- **正文落盘后才显示完成**：worker 先原子写入 `/artifacts/report-{id}.json`（临时文件 + fsync + rename），再更新数据库为 `completed`；查询侧遇到“完成但无正文”会回主库核实，核不到就提示同步中，而不是显示空完成。
+- **主库中断**：从库已追上本会话进度的会话继续可查；本会话受理过但尚未复制的任务、或无法从从库证伪的编号，一律返回 503“主库暂时不可用……”提示，不拿从库旧值冒充，也不误报 404。身份在主库不可达时由已签名 JWT 声明降级还原（只读）。
+
+从库只读、使用 GTID 自动定位。默认 `docker compose up` 不启动从库；高峰期：
+
+```sh
+docker compose --profile replica up -d --build   # 启动 replica 与一次性 replica-setup
+```
+
+然后在 `.env` 设置 `DATABASE_REPLICA_URL=mysql+pymysql://schemaworkbook:<DB_PASSWORD>@replica:3306/schemaworkbook` 并重启 backend。`replica-setup` 创建复制账号、从库 `SELECT` 只读账号，并从主库当前 GTID 位点开始追平。`/health` 额外返回 `replica` 状态（`not-configured` / `healthy` / `unavailable`），从库故障只影响查询来源回退，不阻断健康检查。
+
 ## 工程结构
 
 |服务|技术|职责|
@@ -51,16 +71,17 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 |frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
 |worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
+|db|MySQL8.0|JSON属性与依赖、任务报告（写入与快照；开启 binlog/GTID）|
+|replica|MySQL8.0（profile `replica`）|只读副本，承接报告列表与详情查询|
 |redis|Redis7|持久任务队列|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback/read_session和utils/forms/html/reports共用；request_id/errors双后端中间件。
 
-枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
+枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。报告读取的会话进度下界在 `backend/src/services/read_sessions.py`（内存、单进程；多后端实例需换成共享存储）。
 
-环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
+环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT/REPLICA_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO、DATABASE_REPLICA_URL。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化（仅主库），无在线迁移引擎。
 
-本地开发：Python3.11安装backend/requirements.txt，配置DATABASE_URL/REDIS_URL后从backend运行 `uvicorn src.main:app --reload`、`python -m src.worker`；前端用Nginx同源代理/api。5服务均有健康检查和健康依赖，数据库/Redis/worker产物为独立命名卷。停止清空：`docker compose down -v --remove-orphans`。
+本地开发：Python3.11安装backend/requirements.txt，配置DATABASE_URL/REDIS_URL（可选DATABASE_REPLICA_URL）后从backend运行 `uvicorn src.main:app --reload`、`python -m src.worker`；前端用Nginx同源代理/api。开启从库时共6个服务（`replica` 与一次性 `replica-setup` 属 `replica` profile），均有健康检查和健康依赖，数据库/Redis/worker产物为独立命名卷。停止清空：`docker compose --profile replica down -v --remove-orphans`。
 
 UI为酒红档案册，双字体由Google Fonts加载，离线有回退且业务不依赖字体网络。
 

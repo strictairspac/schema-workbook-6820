@@ -8,6 +8,14 @@ services:
       MYSQL_PASSWORD: ${DB_PASSWORD:-schemaworkbook_demo_pw}
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-schemaworkbook_demo_pw}
       MYSQL_DATABASE: schemaworkbook
+    command:
+      - mysqld
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-expire-logs-seconds=604800
     ports: ["${DB_PORT:-17743}:3306"]
     volumes: [db-data:/var/lib/mysql]
     healthcheck:
@@ -15,6 +23,51 @@ services:
       interval: 3s
       timeout: 3s
       retries: 40
+  # 只读从库：仅承接分解报告查询。默认不启动；高峰期用
+  #   docker compose --profile replica up -d --build
+  # 并在 .env 配置 DATABASE_REPLICA_URL。
+  replica:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-schema-workbook}-replica
+    profiles: ["replica"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-schemaworkbook_demo_pw}
+    command:
+      - mysqld
+      - --server-id=2
+      - --relay-log=relay-bin
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --read-only=ON
+      - --skip-replica-start
+    ports: ["${REPLICA_PORT:-17744}:3306"]
+    volumes: [replica-data:/var/lib/mysql]
+    depends_on:
+      db: {condition: service_healthy}
+    healthcheck:
+      test: [CMD-SHELL, 'mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent']
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  # 一次性引导：创建复制账号并让从库从主库当前 GTID 位置开始追平。
+  replica-setup:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-schema-workbook}-replica-setup
+    profiles: ["replica"]
+    depends_on:
+      db: {condition: service_healthy}
+      replica: {condition: service_healthy}
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD:-schemaworkbook_demo_pw}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mysql -h db -uroot -p"$$DB_PASSWORD" -e "CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED WITH mysql_native_password BY '$$DB_PASSWORD'; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'repl'@'%';"
+        mysql -h replica -uroot -p"$$DB_PASSWORD" -e "CREATE USER IF NOT EXISTS 'schemaworkbook'@'%' IDENTIFIED BY '$$DB_PASSWORD'; GRANT SELECT ON schemaworkbook.* TO 'schemaworkbook'@'%'; STOP REPLICA; CHANGE REPLICATION SOURCE TO SOURCE_HOST='db', SOURCE_USER='repl', SOURCE_PASSWORD='$$DB_PASSWORD', SOURCE_AUTO_POSITION=1; START REPLICA;"
+        echo "replica bootstrapped: SELECT-only read user + GTID auto-position"
+    restart: "no"
   redis:
     image: redis:7-alpine
     container_name: ${COMPOSE_PROJECT_NAME:-schema-workbook}-redis
@@ -30,6 +83,8 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-schema-workbook}-backend
     environment: &env
       DATABASE_URL: mysql+pymysql://schemaworkbook:${DB_PASSWORD:-schemaworkbook_demo_pw}@db:3306/schemaworkbook
+      # 留空则报告查询读主库（单库部署行为不变）；接入从库后查询走只读副本。
+      DATABASE_REPLICA_URL: ${DATABASE_REPLICA_URL:-}
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-local-schema-workbook-change-before-public-use}
       SEED_DEMO: ${SEED_DEMO:-true}
@@ -71,5 +126,6 @@ services:
       retries: 20
 volumes:
   db-data:
+  replica-data:
   redis-data:
   run-artifacts:
